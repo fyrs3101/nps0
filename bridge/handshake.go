@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
 	"time"
 
 	"github.com/djylb/nps/lib/common"
@@ -15,8 +15,8 @@ import (
 	"github.com/djylb/nps/lib/file"
 	"github.com/djylb/nps/lib/logs"
 	"github.com/djylb/nps/lib/mux"
+	"github.com/djylb/nps/lib/p2p"
 	"github.com/djylb/nps/lib/version"
-	"github.com/djylb/nps/server/connection"
 	"github.com/quic-go/quic-go"
 )
 
@@ -357,10 +357,24 @@ func (s *Bridge) typeDeal(c *conn.Conn, id, ver int, vs, tunnelType string, firs
 		if ver > 4 {
 			go func() {
 				defer func() {
-					logs.Trace("Tunnel connection closed, client %d, remote %v", id, addr)
+					reason := tunnelCloseReason(anyConn)
+					if reason != "" {
+						logs.Trace("Tunnel connection closed, client %d, remote %v, reason: %s", id, addr, reason)
+					} else {
+						logs.Trace("Tunnel connection closed, client %d, remote %v", id, addr)
+					}
 					_ = c.Close()
 					_ = node.Close()
-					client.RemoveOfflineNodes(false)
+					removed := client.RemoveOfflineNodes(false)
+					logs.Warn(
+						"Disconnect summary event=disconnect_summary role=server client=%d uuid=%s remote=%v removed=%d remaining=%d reason=%q",
+						id,
+						uuid,
+						addr,
+						removed,
+						client.NodeCount(),
+						reason,
+					)
 				}()
 				switch t := anyConn.(type) {
 				case *mux.Mux:
@@ -499,19 +513,6 @@ func (s *Bridge) typeDeal(c *conn.Conn, id, ver int, vs, tunnelType string, firs
 			_ = c.Close()
 			return
 		}
-		serverPort := connection.P2pPort
-		if serverPort == 0 {
-			logs.Warn("get local udp addr error")
-			_ = c.Close()
-			return
-		}
-		serverIP := common.GetServerIp(connection.P2pIp)
-		svrAddr := common.BuildAddress(serverIP, strconv.Itoa(serverPort))
-		signalAddr := common.BuildAddress(serverIP, strconv.Itoa(serverPort))
-		remoteIP := net.ParseIP(common.GetIpByAddr(c.RemoteAddr().String()))
-		if remoteIP != nil && (remoteIP.IsPrivate() || remoteIP.IsLoopback() || remoteIP.IsLinkLocalUnicast()) {
-			svrAddr = common.BuildAddress(common.GetIpByAddr(c.LocalAddr().String()), strconv.Itoa(serverPort))
-		}
 		client := v.(*Client)
 		node := client.GetNode()
 		if node == nil {
@@ -525,31 +526,67 @@ func (s *Bridge) typeDeal(c *conn.Conn, id, ver int, vs, tunnelType string, firs
 			_ = c.Close()
 			return
 		}
-		signalIP := net.ParseIP(common.GetIpByAddr(signal.RemoteAddr().String()))
-		if signalIP != nil && (signalIP.IsPrivate() || signalIP.IsLoopback() || signalIP.IsLinkLocalUnicast()) {
-			signalAddr = common.BuildAddress(common.GetIpByAddr(signal.LocalAddr().String()), strconv.Itoa(serverPort))
-		}
-		_, _ = signal.BufferWrite([]byte(common.NEW_UDP_CONN))
-		_ = signal.WriteLenContent([]byte(signalAddr))
-		_ = signal.WriteLenContent(b)
-		if err := signal.FlushBuf(); err != nil {
-			logs.Warn("client signal flush error: %v", err)
-			_ = signal.Close()
+		visitorProbe := buildProbeConfig(c)
+		providerProbe := buildProbeConfig(signal)
+		session, err := s.p2pSessions.create(id, t.Client.Id, t, c, visitorProbe, providerProbe)
+		if err != nil {
+			logs.Warn("create p2p session failed: %v", err)
 			_ = c.Close()
 			return
 		}
-		_ = c.WriteLenContent([]byte(svrAddr))
-		if err := c.FlushBuf(); err != nil {
-			logs.Warn("p2p head flush error: %v", err)
+		if err := p2p.WriteBridgeMessage(c, common.P2P_PUNCH_START, session.visitorStart); err != nil {
+			logs.Warn("send visitor p2p start failed: %v", err)
+			session.abort("send visitor start failed")
+			_ = c.Close()
+			return
 		}
-		logs.Trace("P2P: remoteIP=%s, svr1Addr=%s, clientIP=%s, svr2Addr=%s", remoteIP, svrAddr, signalIP, signalAddr)
-		time.Sleep(time.Second)
-		_ = c.Close()
+		if err := p2p.WriteBridgeMessage(signal, common.P2P_PUNCH_START, session.providerStart); err != nil {
+			logs.Warn("send provider p2p start failed: %v", err)
+			session.abort("send provider start failed")
+			_ = c.Close()
+			return
+		}
+		go session.serve(common.WORK_P2P_VISITOR, c)
+		return
+
+	case common.WORK_P2P_SESSION:
+		raw, err := c.GetShortLenContent()
+		if err != nil {
+			_ = c.Close()
+			return
+		}
+		var join p2p.P2PSessionJoin
+		if err := json.Unmarshal(raw, &join); err != nil {
+			_ = c.Close()
+			return
+		}
+		session, ok := s.p2pSessions.get(join.SessionID)
+		if !ok || session == nil || session.token != join.Token || session.providerID != id {
+			_ = c.Close()
+			return
+		}
+		if !session.attachProvider(c) {
+			_ = c.Close()
+			return
+		}
+		go session.serve(common.WORK_P2P_PROVIDER, c)
 		return
 	}
 
 	c.SetAlive()
 	//return
+}
+
+func tunnelCloseReason(v any) string {
+	switch t := v.(type) {
+	case *mux.Mux:
+		return t.CloseReason()
+	case *quic.Conn:
+		if err := t.Context().Err(); err != nil {
+			return err.Error()
+		}
+	}
+	return ""
 }
 
 // register ip

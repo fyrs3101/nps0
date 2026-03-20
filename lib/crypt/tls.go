@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -114,12 +115,15 @@ func DecryptWithPrivateKey(base64Cipher string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode error: %w", err)
 	}
-	// Decrypt using PKCS#1 v1.5
+	plain, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, rsaKey, cipherBytes, nil)
+	if err == nil {
+		return plain, nil
+	}
 	//nolint:staticcheck // legacy PKCS1v15 compatibility
 	//lint:ignore SA1019 legacy PKCS1v15 compatibility
-	plain, err := rsa.DecryptPKCS1v15(rand.Reader, rsaKey, cipherBytes)
-	if err != nil {
-		return nil, fmt.Errorf("RSA decrypt error: %w", err)
+	plain, legacyErr := rsa.DecryptPKCS1v15(rand.Reader, rsaKey, cipherBytes)
+	if legacyErr != nil {
+		return nil, fmt.Errorf("RSA decrypt error: oaep: %w; pkcs1v15: %v", err, legacyErr)
 	}
 	return plain, nil
 }
@@ -156,6 +160,48 @@ func GetCertFingerprint(certificate tls.Certificate) []byte {
 	}
 	sum := sha256.Sum256(certificate.Certificate[0])
 	return sum[:]
+}
+
+func EncodePeerTransportData(certificateDER []byte) string {
+	if len(certificateDER) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(certificateDER)
+	return hex.EncodeToString(sum[:])
+}
+
+func VerifyPeerTransportData(vkey, transportData string, certificateDER []byte) bool {
+	if transportData == "" || len(certificateDER) == 0 {
+		return false
+	}
+	sum := sha256.Sum256(certificateDER)
+	if decoded, err := hex.DecodeString(transportData); err == nil {
+		if subtle.ConstantTimeCompare(decoded, sum[:]) == 1 {
+			return true
+		}
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(transportData); err == nil {
+		if subtle.ConstantTimeCompare(decoded, sum[:]) == 1 {
+			return true
+		}
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(transportData); err == nil {
+		if subtle.ConstantTimeCompare(decoded, sum[:]) == 1 {
+			return true
+		}
+	}
+
+	expected := GetHMAC(vkey, certificateDER)
+	if decoded, err := hex.DecodeString(transportData); err == nil {
+		return subtle.ConstantTimeCompare(decoded, expected) == 1
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(transportData); err == nil {
+		return subtle.ConstantTimeCompare(decoded, expected) == 1
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(transportData); err == nil {
+		return subtle.ConstantTimeCompare(decoded, expected) == 1
+	}
+	return subtle.ConstantTimeCompare([]byte(transportData), expected) == 1
 }
 
 func AddTrustedCert(vkey string, fp []byte) {

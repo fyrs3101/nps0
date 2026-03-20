@@ -2,11 +2,12 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/djylb/nps/lib/common"
@@ -27,6 +28,7 @@ type TRPClient struct {
 	localIP        string
 	vKey           string
 	uuid           string
+	p2pSTUNServers []string
 	tunnel         any
 	signal         *conn.Conn
 	fsm            *FileServerManager
@@ -37,10 +39,13 @@ type TRPClient struct {
 	cancel         context.CancelFunc
 	healthChecker  *HealthChecker
 	once           sync.Once
+	startedNano    int64
+	reasonMu       sync.RWMutex
+	closeReason    string
 }
 
 // NewRPClient new client
-func NewRPClient(svrAddr, vKey, bridgeConnType, proxyUrl, localIP, uuid string, cnf *config.Config, disconnectTime int, fsm *FileServerManager) *TRPClient {
+func NewRPClient(svrAddr, vKey, bridgeConnType, proxyUrl, localIP, uuid string, cnf *config.Config, disconnectTime int, fsm *FileServerManager, p2pSTUNServers []string) *TRPClient {
 	return &TRPClient{
 		svrAddr:        svrAddr,
 		vKey:           vKey,
@@ -48,6 +53,7 @@ func NewRPClient(svrAddr, vKey, bridgeConnType, proxyUrl, localIP, uuid string, 
 		proxyUrl:       proxyUrl,
 		localIP:        localIP,
 		uuid:           uuid,
+		p2pSTUNServers: append([]string{}, p2pSTUNServers...),
 		cnf:            cnf,
 		disconnectTime: disconnectTime,
 		fsm:            fsm,
@@ -137,6 +143,7 @@ func (s *TRPClient) Start(ctx context.Context) {
 		s.healthChecker.Start()
 	}
 	NowStatus = 1
+	s.markConnected()
 	//msg connection, eg udp
 	s.handleMain()
 }
@@ -152,46 +159,30 @@ func (s *TRPClient) handleMain() {
 		}
 		flags, err := s.signal.ReadFlag()
 		if err != nil {
-			logs.Error("Accept server data error %v, end this service", err)
+			s.noteCloseReason("signal read failed: " + conn.DescribeNetError(err, s.signal.Conn))
+			logs.Error("Accept server data error %s, end this service", conn.DescribeNetError(err, s.signal.Conn))
 			return
 		}
 		switch flags {
-		case common.NEW_UDP_CONN:
-			//read server udp addr and password
-			if lAddr, err := s.signal.GetShortLenContent(); err != nil {
+		case common.P2P_PUNCH_START:
+			raw, err := s.signal.GetShortLenContent()
+			if err != nil {
 				logs.Warn("%v", err)
 				return
-			} else if pwd, err := s.signal.GetShortLenContent(); err == nil {
-				rAddr := string(lAddr)
-				remoteIP := net.ParseIP(common.GetIpByAddr(s.signal.RemoteAddr().String()))
-				if remoteIP != nil && (remoteIP.IsPrivate() || remoteIP.IsLoopback() || remoteIP.IsLinkLocalUnicast()) {
-					rAddr = common.BuildAddress(remoteIP.String(), strconv.Itoa(common.GetPortByAddr(rAddr)))
-				}
-				var localAddr string
-				if strings.Contains(rAddr, "]:") {
-					addr6, err := common.GetLocalUdp6Addr()
-					if err != nil {
-						logs.Error("%v", err)
-						return
-					}
-					localAddr = addr6.String()
-				} else {
-					addr4, err := common.GetLocalUdp4Addr()
-					if err != nil {
-						logs.Error("%v", err)
-						return
-					}
-					localAddr = addr4.String()
-				}
-				if !DisableP2P {
-					go s.newUdpConn(localAddr, rAddr, string(pwd))
-				}
+			}
+			var start p2p.P2PPunchStart
+			if err := json.Unmarshal(raw, &start); err != nil {
+				logs.Warn("decode p2p start failed: %v", err)
+				continue
+			}
+			if !DisableP2P {
+				go s.joinP2PSession(start)
 			}
 		}
 	}
 }
 
-func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
+func (s *TRPClient) joinP2PSession(start p2p.P2PPunchStart) {
 	wait := time.Duration(s.disconnectTime) * time.Second
 	if wait <= 0 {
 		wait = 30 * time.Second
@@ -199,17 +190,55 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 	p2pCtx, cancelP2P := context.WithTimeout(s.ctx, wait)
 	defer cancelP2P()
 
+	preferredLocalAddr := preferredP2PLocalAddr(s.localIP)
+	controlConn, uuid, err := NewConn(s.bridgeConnType, s.vKey, s.svrAddr, s.proxyUrl, s.localIP)
+	if err != nil {
+		logs.Error("provider join new conn failed: %v", err)
+		return
+	}
+	defer func() {
+		if controlConn != nil {
+			_ = controlConn.Close()
+		}
+	}()
+	closeControl := func() {
+		if controlConn == nil {
+			return
+		}
+		_ = controlConn.Close()
+		controlConn = nil
+	}
+	if s.uuid == "" {
+		s.uuid = uuid
+	}
+	if err := SendType(controlConn, common.WORK_P2P_SESSION, s.uuid); err != nil {
+		logs.Error("provider join send type failed: %v", err)
+		return
+	}
+	if _, err := controlConn.SendInfo(&p2p.P2PSessionJoin{
+		SessionID: start.SessionID,
+		Token:     start.Token,
+	}, ""); err != nil {
+		logs.Error("provider join send session info failed: %v", err)
+		return
+	}
+
 	var localConn net.PacketConn
-	var err error
-	var remoteAddress, role, mode, data string
-	sendData := string(crypt.GetHMAC(s.vKey, crypt.GetCert().Certificate[0]))
-	//logs.Debug("newUdpConn %s %s", localAddr, rAddr)
-	if localConn, remoteAddress, localAddr, role, mode, data, err = p2p.HandleUDP(p2pCtx, localAddr, rAddr, md5Password, common.WORK_P2P_PROVIDER, P2PMode, sendData); err != nil {
-		logs.Error("handle P2P error: %v", err)
+	var remoteAddress, sessionID, role, mode, data string
+	var transportTimeout time.Duration
+	sendData := ""
+	if P2PMode == common.CONN_QUIC {
+		sendData = crypt.EncodePeerTransportData(crypt.GetCert().Certificate[0])
+	}
+	if localConn, remoteAddress, preferredLocalAddr, sessionID, role, mode, data, transportTimeout, err = p2p.RunProviderSession(p2pCtx, controlConn, start, preferredLocalAddr, P2PMode, sendData, s.p2pSTUNServers); err != nil {
+		logs.Error("run provider P2P session error: %v", err)
 		return
 	}
 	defer func() { _ = localConn.Close() }()
-	watchdog := time.AfterFunc(wait, func() {
+	if transportTimeout <= 0 {
+		transportTimeout = 10 * time.Second
+	}
+	watchdog := time.AfterFunc(transportTimeout, func() {
 		logs.Warn("P2P provider punch timeout, closing local socket %v", localConn.LocalAddr())
 		_ = localConn.Close()
 	})
@@ -217,10 +246,22 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 	if mode == "" || mode != P2PMode {
 		mode = common.CONN_KCP
 	}
+	_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+		SessionID:  sessionID,
+		Role:       role,
+		Stage:      "transport_start",
+		Status:     "ok",
+		LocalAddr:  preferredLocalAddr,
+		RemoteAddr: remoteAddress,
+		Detail:     mode,
+		Meta: map[string]string{
+			"transport_mode": mode,
+		},
+	})
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	timer := time.AfterFunc(wait, func() {
+	timer := time.AfterFunc(transportTimeout, func() {
 		cancel()
 	})
 	defer timer.Stop()
@@ -241,6 +282,15 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 		quicListener, err = quic.Listen(localConn, crypt.GetCertCfg(), QuicConfig)
 		if err != nil {
 			logs.Error("quic.Listen err: %v", err)
+			_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+				SessionID:  sessionID,
+				Role:       role,
+				Stage:      "transport_fail_stage",
+				Status:     "fail",
+				LocalAddr:  preferredLocalAddr,
+				RemoteAddr: remoteAddress,
+				Detail:     "quic_listen",
+			})
 			return
 		}
 		defer func() { _ = quicListener.Close() }()
@@ -248,6 +298,15 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 		kcpListener, err = kcp.ServeConn(nil, 10, 3, localConn)
 		if err != nil {
 			logs.Error("kcp.ServeConn err: %v", err)
+			_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+				SessionID:  sessionID,
+				Role:       role,
+				Stage:      "transport_fail_stage",
+				Status:     "fail",
+				LocalAddr:  preferredLocalAddr,
+				RemoteAddr: remoteAddress,
+				Detail:     "kcp_listen",
+			})
 			return
 		}
 		defer func() { _ = kcpListener.Close() }()
@@ -263,7 +322,7 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 		defer done()
 	}
 
-	logs.Trace("start local p2p udp[%s] listen, role[%s], local address %s %v", mode, role, localAddr, localConn.LocalAddr())
+	logs.Trace("start local p2p udp[%s] listen, role[%s], local address %s %v", mode, role, preferredLocalAddr, localConn.LocalAddr())
 	if data != "" {
 		logs.Trace("P2P udp data is %s", data)
 	}
@@ -278,6 +337,15 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 			sess, err := quicListener.Accept(ctx)
 			if err != nil {
 				logs.Warn("QUIC accept session error: %v", err)
+				_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+					SessionID:  sessionID,
+					Role:       role,
+					Stage:      "transport_fail_stage",
+					Status:     "fail",
+					LocalAddr:  preferredLocalAddr,
+					RemoteAddr: remoteAddress,
+					Detail:     "quic_accept",
+				})
 				return
 			}
 			if sess.RemoteAddr().String() != remoteAddress {
@@ -294,6 +362,16 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 				_ = sess.CloseWithError(0, "timer already fired")
 				return
 			}
+			_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+				SessionID:  sessionID,
+				Role:       role,
+				Stage:      "transport_established",
+				Status:     "ok",
+				LocalAddr:  preferredLocalAddr,
+				RemoteAddr: remoteAddress,
+				Detail:     mode,
+			})
+			closeControl()
 			for {
 				stream, err := sess.AcceptStream(ctx)
 				if err != nil {
@@ -308,6 +386,15 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 			udpTunnel, err := kcpListener.AcceptKCP()
 			if err != nil {
 				logs.Error("acceptKCP failed on listener %v waiting for remote %s: %v", localConn.LocalAddr(), remoteAddress, err)
+				_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+					SessionID:  sessionID,
+					Role:       role,
+					Stage:      "transport_fail_stage",
+					Status:     "fail",
+					LocalAddr:  preferredLocalAddr,
+					RemoteAddr: remoteAddress,
+					Detail:     "kcp_accept",
+				})
 				return
 			}
 			if udpTunnel.RemoteAddr().String() != remoteAddress {
@@ -324,6 +411,16 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 				_ = udpTunnel.Close()
 				return
 			}
+			_ = p2p.WritePunchProgress(controlConn, p2p.P2PPunchProgress{
+				SessionID:  sessionID,
+				Role:       role,
+				Stage:      "transport_established",
+				Status:     "ok",
+				LocalAddr:  preferredLocalAddr,
+				RemoteAddr: remoteAddress,
+				Detail:     mode,
+			})
+			closeControl()
 			done()
 			conn.SetUdpSession(udpTunnel)
 			logs.Trace("successful connection with client ,address %v", udpTunnel.RemoteAddr())
@@ -401,6 +498,7 @@ func (s *TRPClient) newChan() {
 			}
 
 			if err != nil {
+				s.noteCloseReason("tunnel accept failed: " + err.Error())
 				logs.Warn("Accept error on mux: %v", err)
 				s.Close()
 				return
@@ -488,6 +586,7 @@ func (s *TRPClient) ping() {
 		select {
 		case <-s.ticker.C:
 			if s.isTunnelClosed() {
+				s.noteCloseReason(s.snapshotCloseReason())
 				s.Close()
 				return
 			}
@@ -517,10 +616,16 @@ func (s *TRPClient) Close() {
 
 func (s *TRPClient) closing() {
 	NowStatus = 0
+	if reason := s.snapshotCloseReason(); reason != "" {
+		s.noteCloseReason(reason)
+	}
+	s.logDisconnectSummary()
 	if s.healthChecker != nil {
 		s.healthChecker.Stop()
 	}
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.closeTunnel("close")
 	if s.signal != nil {
 		_ = s.signal.Close()
@@ -528,6 +633,76 @@ func (s *TRPClient) closing() {
 	if s.ticker != nil {
 		s.ticker.Stop()
 	}
+}
+
+func (s *TRPClient) markConnected() {
+	atomic.StoreInt64(&s.startedNano, time.Now().UnixNano())
+}
+
+func (s *TRPClient) noteCloseReason(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		return
+	}
+	s.reasonMu.Lock()
+	defer s.reasonMu.Unlock()
+	if s.closeReason == "" {
+		s.closeReason = reason
+	}
+}
+
+func (s *TRPClient) getCloseReason() string {
+	s.reasonMu.RLock()
+	defer s.reasonMu.RUnlock()
+	return s.closeReason
+}
+
+func (s *TRPClient) snapshotCloseReason() string {
+	if reason := s.getCloseReason(); reason != "" {
+		return reason
+	}
+	if s.tunnel != nil {
+		switch t := s.tunnel.(type) {
+		case *mux.Mux:
+			if reason := t.CloseReason(); reason != "" {
+				return reason
+			}
+		case *quic.Conn:
+			if err := t.Context().Err(); err != nil {
+				return "quic tunnel closed: " + err.Error()
+			}
+		}
+	}
+	if s.signal != nil && s.signal.IsClosed() {
+		return "signal connection closed"
+	}
+	return ""
+}
+
+func (s *TRPClient) logDisconnectSummary() {
+	started := atomic.LoadInt64(&s.startedNano)
+	reason := s.getCloseReason()
+	if started == 0 && s.signal == nil && s.tunnel == nil && reason == "" {
+		return
+	}
+	if reason == "" {
+		reason = "close requested"
+	}
+	uptime := time.Duration(0)
+	if started > 0 {
+		uptime = time.Since(time.Unix(0, started)).Round(time.Millisecond)
+	}
+	tunnelUp := !s.isTunnelClosed()
+	signalUp := s.signal != nil && !s.signal.IsClosed()
+	logs.Warn(
+		"Disconnect summary event=disconnect_summary role=client server=%s bridge=%s uuid=%s uptime=%s tunnel_up=%t signal_up=%t reason=%q",
+		s.svrAddr,
+		s.bridgeConnType,
+		s.uuid,
+		uptime,
+		tunnelUp,
+		signalUp,
+		reason,
+	)
 }
 
 func (s *TRPClient) closeTunnel(err string) {

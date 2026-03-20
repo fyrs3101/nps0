@@ -305,11 +305,11 @@ func (s *Conn) getInfo(t interface{}) (err error) {
 	defer common.BufPool.Put(buf)
 	if l, err = s.GetLen(); err != nil {
 		return
-	} else if _, err = s.ReadLen(l, buf); err != nil {
-		return
-	} else {
-		_ = json.Unmarshal(buf[:l], &t)
 	}
+	if _, err = s.ReadLen(l, buf); err != nil {
+		return
+	}
+	_ = json.Unmarshal(buf[:l], &t)
 	return
 }
 
@@ -348,14 +348,13 @@ func (s *Conn) Write(b []byte) (n int, err error) {
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.wBuf == nil || s.wBuf.Len() == 0 {
-		s.mu.Unlock()
 		return s.Conn.Write(b)
 	}
 	n, err = s.wBuf.Write(b)
 	toSend := s.wBuf.Bytes()
 	s.wBuf.Reset()
-	defer s.mu.Unlock()
 
 	if _, err := s.Conn.Write(toSend); err != nil {
 		return 0, err
