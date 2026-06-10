@@ -18,52 +18,9 @@ import (
 const TotpLen = 6
 
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+var newQRCode = qrcode.New
 
-func GenerateTOTPSecret() (string, error) {
-	buf := make([]byte, 10)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return strings.ToUpper(b32.EncodeToString(buf)), nil
-}
-
-func ValidateTOTPCode(secret, code string) (bool, error) {
-	key, err := b32.DecodeString(strings.ToUpper(secret))
-	if err != nil {
-		return false, err
-	}
-	pass, err := strconv.Atoi(code)
-	if err != nil {
-		return false, err
-	}
-	now := time.Now().UTC().Unix() / 30
-	for i := -1; i <= 1; i++ {
-		counter := now + int64(i)
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, uint64(counter))
-		mac := hmac.New(sha1.New, key)
-		mac.Write(buf)
-		hash := mac.Sum(nil)
-		offset := hash[len(hash)-1] & 0x0F
-		val := (int(hash[offset])&0x7F)<<24 |
-			(int(hash[offset+1])&0xFF)<<16 |
-			(int(hash[offset+2])&0xFF)<<8 |
-			(int(hash[offset+3]) & 0xFF)
-		val %= 1000000
-		if val == pass {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func GetTOTPCode(secret string) (string, int64, error) {
-	key, err := b32.DecodeString(strings.ToUpper(secret))
-	if err != nil {
-		return "", 0, err
-	}
-	now := time.Now().UTC().Unix()
-	counter := now / 30
+func totpValue(key []byte, counter int64) int {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, uint64(counter))
 	mac := hmac.New(sha1.New, key)
@@ -74,13 +31,53 @@ func GetTOTPCode(secret string) (string, int64, error) {
 		(int(hash[offset+1])&0xFF)<<16 |
 		(int(hash[offset+2])&0xFF)<<8 |
 		(int(hash[offset+3]) & 0xFF)
-	val %= 1000000
+	return val % 1000000
+}
+
+func GenerateTOTPSecret() (string, error) {
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return strings.ToUpper(b32.EncodeToString(buf)), nil
+}
+
+func ValidateTOTPCode(secret, code string) (bool, error) {
+	secret = strings.ToUpper(strings.TrimSpace(secret))
+	code = strings.TrimSpace(code)
+	key, err := b32.DecodeString(secret)
+	if err != nil {
+		return false, err
+	}
+	pass, err := strconv.Atoi(code)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC().Unix() / 30
+	for i := -1; i <= 1; i++ {
+		if totpValue(key, now+int64(i)) == pass {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func GetTOTPCode(secret string) (string, int64, error) {
+	secret = strings.ToUpper(strings.TrimSpace(secret))
+	key, err := b32.DecodeString(secret)
+	if err != nil {
+		return "", 0, err
+	}
+	now := time.Now().UTC().Unix()
+	counter := now / 30
+	val := totpValue(key, counter)
 	code := fmt.Sprintf("%06d", val)
 	remaining := 30 - (now % 30)
 	return code, remaining, nil
 }
 
 func IsValidTOTPSecret(secret string) bool {
+	secret = strings.ToUpper(strings.TrimSpace(secret))
 	if _, err := b32.DecodeString(secret); err != nil {
 		return false
 	}
@@ -118,9 +115,10 @@ func PrintTOTPSecret() {
 	}
 	fmt.Printf("Your new 2FA secret is: %s\nPlease add this secret to your nps.conf configuration file.\n", secret)
 	totpUrl := BuildTotpUri("", "NPS", secret)
-	qr, err := qrcode.New(totpUrl, qrcode.Medium)
+	qr, err := newQRCode(totpUrl, qrcode.Medium)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Failed to generate 2FA QR code: %v\n", err)
+		return
 	}
 	ascii := qr.ToString(false)
 	fmt.Println(ascii)

@@ -1,445 +1,474 @@
 package p2p
 
 import (
-	"errors"
+	"context"
 	"net"
 	"testing"
+	"time"
+
+	"github.com/djylb/nps/lib/common"
 )
 
-func TestGetNextAddr(t *testing.T) {
-	got, err := getNextAddr("127.0.0.1:2000", 5)
-	if err != nil {
-		t.Fatalf("getNextAddr returned error: %v", err)
-	}
-	if got != "127.0.0.1:2005" {
-		t.Fatalf("getNextAddr = %q, want %q", got, "127.0.0.1:2005")
-	}
+func waitForProviderNominationBeforeReady(t *testing.T, session *runtimeSession, timeout time.Duration) {
+	t.Helper()
 
-	if _, err := getNextAddr("127.0.0.1", 1); err == nil {
-		t.Fatal("expected invalid address to return error")
-	}
-}
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
-func TestGetAddrInterval(t *testing.T) {
-	tests := []struct {
-		name    string
-		a1      string
-		a2      string
-		a3      string
-		want    int
-		wantErr bool
-	}{
-		{name: "positive interval", a1: "1.1.1.1:1000", a2: "1.1.1.1:1003", a3: "1.1.1.1:1006", want: 3},
-		{name: "negative interval", a1: "1.1.1.1:1006", a2: "1.1.1.1:1003", a3: "1.1.1.1:1000", want: -3},
-		{name: "invalid input", a1: "bad", a2: "1.1.1.1:1003", a3: "1.1.1.1:1000", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := getAddrInterval(tt.a1, tt.a2, tt.a3)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
+	for {
+		select {
+		case pair := <-session.confirmed:
+			t.Fatalf("provider should not handover before READY, got %#v", pair)
+		case <-deadline:
+			t.Fatal("provider should keep a nominated pair after END")
+		case <-ticker.C:
+			if session.cm.HasConfirmed() {
+				t.Fatal("provider should not mark pair confirmed before READY")
+			}
+			if session.cm.HasNominated() {
 				return
 			}
-			if err != nil {
-				t.Fatalf("getAddrInterval returned error: %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("getAddrInterval = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestGetRandomUniquePorts(t *testing.T) {
-	ports := getRandomUniquePorts(20, 10000, 10030)
-	if len(ports) != 20 {
-		t.Fatalf("len(ports) = %d, want 20", len(ports))
-	}
-	seen := make(map[int]struct{}, len(ports))
-	for _, p := range ports {
-		if p < 10000 || p > 10030 {
-			t.Fatalf("port %d is out of range", p)
-		}
-		if _, ok := seen[p]; ok {
-			t.Fatalf("duplicate port %d", p)
-		}
-		seen[p] = struct{}{}
-	}
-
-	all := getRandomUniquePorts(100, 2000, 2002)
-	if len(all) != 3 {
-		t.Fatalf("len(all) = %d, want 3", len(all))
-	}
-
-	nilPorts := getRandomUniquePorts(1, 5, 4)
-	if len(nilPorts) != 1 {
-		t.Fatalf("min/max swap failed, got len = %d", len(nilPorts))
-	}
-}
-
-func TestShouldRunFallbackRandomScan(t *testing.T) {
-	tests := []struct {
-		name                      string
-		aggressive, forceHard, pr bool
-		want                      bool
-	}{
-		{name: "all false", aggressive: false, forceHard: false, pr: false, want: false},
-		{name: "aggressive", aggressive: true, forceHard: false, pr: false, want: true},
-		{name: "force-hard", aggressive: false, forceHard: true, pr: false, want: true},
-		{name: "port-restricted", aggressive: false, forceHard: false, pr: true, want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldRunFallbackRandomScan(tt.aggressive, false, tt.forceHard, tt.pr); got != tt.want {
-				t.Fatalf("shouldRunFallbackRandomScan(%v,%v,%v,%v)=%v, want %v", tt.aggressive, false, tt.forceHard, tt.pr, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPickPrimaryPunchTarget(t *testing.T) {
-	exact := []string{"1.1.1.1:1000", "1.1.1.1:1001"}
-	pred := []string{"1.1.1.1:1003", "1.1.1.1:1002"}
-
-	if got := pickPrimaryPunchTarget(exact, pred, true); got != "1.1.1.1:1003" {
-		t.Fatalf("aggressive primary = %q, want %q", got, "1.1.1.1:1003")
-	}
-	if got := pickPrimaryPunchTarget(exact, pred, false); got != "1.1.1.1:1000" {
-		t.Fatalf("conservative primary = %q, want %q", got, "1.1.1.1:1000")
-	}
-	if got := pickPrimaryPunchTarget(nil, pred, false); got != "1.1.1.1:1003" {
-		t.Fatalf("fallback prediction primary = %q, want %q", got, "1.1.1.1:1003")
-	}
-	if got := pickPrimaryPunchTarget(nil, nil, true); got != "" {
-		t.Fatalf("empty primary = %q, want empty", got)
-	}
-}
-
-func TestBuildSmallContiguousPorts(t *testing.T) {
-	ports := buildSmallContiguousPorts(100, 2)
-	want := []int{100, 101, 99, 102, 98}
-	if len(ports) != len(want) {
-		t.Fatalf("len(ports)=%d, want %d (%#v)", len(ports), len(want), ports)
-	}
-	for i := range want {
-		if ports[i] != want[i] {
-			t.Fatalf("ports[%d]=%d, want %d (%#v)", i, ports[i], want[i], ports)
 		}
 	}
+}
 
-	edge := buildSmallContiguousPorts(1, 2)
-	if len(edge) == 0 || edge[0] != 1 {
-		t.Fatalf("unexpected edge result: %#v", edge)
+func TestWorkerForConfirmedPairMatchesAdditionalSocketOwner(t *testing.T) {
+	localConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(local) error = %v", err)
 	}
-	for _, p := range edge {
-		if p < 1 || p > 65535 {
-			t.Fatalf("out-of-range port in edge result: %#v", edge)
+	defer func() { _ = localConn.Close() }()
+	extraConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(extra) error = %v", err)
+	}
+	defer func() { _ = extraConn.Close() }()
+
+	rs := &runtimeSession{
+		localConn: localConn,
+		sockets:   []net.PacketConn{localConn, extraConn},
+	}
+	worker := &runtimeFamilyWorker{family: udpFamilyV4, rs: rs}
+	pair := confirmedPair{
+		owner:      rs,
+		conn:       extraConn,
+		localAddr:  extraConn.LocalAddr().String(),
+		remoteAddr: "1.1.1.1:5000",
+	}
+	if got := workerForConfirmedPair([]*runtimeFamilyWorker{worker}, pair); got != worker {
+		t.Fatalf("workerForConfirmedPair() = %#v, want owner worker", got)
+	}
+}
+
+func TestRuntimeSessionKeepsConfirmedRemoteStable(t *testing.T) {
+	session := &runtimeSession{}
+	session.updateCandidateRemote("1.1.1.1:5002")
+	session.updateConfirmedRemote("1.1.1.1:5002")
+	session.updateCandidateRemote("1.1.1.1:5010")
+	if session.endpoints.CandidateRemote != "1.1.1.1:5002" {
+		t.Fatalf("CandidateRemote changed to %q", session.endpoints.CandidateRemote)
+	}
+	if session.endpoints.ConfirmedRemote != "1.1.1.1:5002" {
+		t.Fatalf("ConfirmedRemote changed to %q", session.endpoints.ConfirmedRemote)
+	}
+}
+
+func TestRuntimeSessionDropsWrongTokenSilently(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_VISITOR,
+		},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	wrong := newUDPPacket("session-1", "wrong-token", common.WORK_P2P_PROVIDER, packetTypeSucc)
+	wrongRaw, err := EncodeUDPPacket(wrong)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(wrong) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(wrongRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(wrong) error = %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if session.cm.HasNominated() || session.cm.HasConfirmed() || session.endpoints.CandidateRemote != "" {
+		t.Fatal("wrong-token packet should be silently dropped")
+	}
+	if stats := session.snapshotStats(); stats.tokenMismatchDropped == 0 {
+		t.Fatal("wrong-token packet should increase mismatch counter")
+	}
+
+	right := newUDPPacket("session-1", "token-1", common.WORK_P2P_PROVIDER, packetTypeSucc)
+	rightRaw, err := EncodeUDPPacket(right)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(right) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(rightRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(right) error = %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	pair := session.cm.NominatedPair()
+	if pair == nil {
+		t.Fatal("valid packet should still progress handshake after wrong-token packet")
+	}
+	if pair.RemoteAddr != sendConn.LocalAddr().String() {
+		t.Fatalf("nominated remote = %q, want %q", pair.RemoteAddr, sendConn.LocalAddr().String())
+	}
+	if stats := session.snapshotStats(); !stats.tokenVerified {
+		t.Fatal("valid packet should mark token verified")
+	}
+}
+
+func TestRuntimeSessionDropsWrongWireRouteSilently(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Wire:      P2PWireSpec{RouteID: "route-a"},
+			Role:      common.WORK_P2P_VISITOR,
+		},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	wrongRoute := newUDPPacketWithWire("session-1", "token-1", common.WORK_P2P_PROVIDER, packetTypeSucc, P2PWireSpec{RouteID: "route-b"})
+	wrongRouteRaw, err := EncodeUDPPacket(wrongRoute)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(wrongRoute) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(wrongRouteRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(wrongRoute) error = %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if session.cm.HasNominated() || session.cm.HasConfirmed() || session.endpoints.CandidateRemote != "" {
+		t.Fatal("wrong-route packet should be silently dropped")
+	}
+	if stats := session.snapshotStats(); stats.tokenMismatchDropped == 0 {
+		t.Fatal("wrong-route packet should increase mismatch counter")
+	}
+}
+
+func TestRuntimeSessionDropsReplaySilently(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_PROVIDER,
+		},
+		cm:        NewCandidateManager(""),
+		replay:    NewReplayWindow(30 * time.Second),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	packet := newUDPPacket("session-1", "token-1", common.WORK_P2P_VISITOR, packetTypeProbe)
+	raw, err := EncodeUDPPacket(packet)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket() error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(raw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(first) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(raw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(replay) error = %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if stats := session.snapshotStats(); stats.replayDropped == 0 {
+		t.Fatal("replayed packet should increase replay counter")
+	}
+}
+
+func TestRuntimeSessionDoesNotHandoverBeforeConfirm(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_VISITOR,
+		},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	success := newUDPPacket("session-1", "token-1", common.WORK_P2P_PROVIDER, packetTypeSucc)
+	raw, err := EncodeUDPPacket(success)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(success) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(raw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(success) error = %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case pair := <-session.confirmed:
+		t.Fatalf("session should not handover before confirm, got %#v", pair)
+	default:
+	}
+	if session.cm.HasConfirmed() {
+		t.Fatal("confirmed pair should stay empty before ACCEPT")
+	}
+}
+
+func TestRuntimeSessionProviderWaitsForReadyBeforeHandover(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_PROVIDER,
+		},
+		plan:      PunchPlan{NominationRetryInterval: 40 * time.Millisecond},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+		accept:    make(map[string]context.CancelFunc),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	end := newUDPPacket("session-1", "token-1", common.WORK_P2P_VISITOR, packetTypeEnd)
+	end.NominationEpoch = 1
+	endRaw, err := EncodeUDPPacket(end)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(end) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(endRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(end) error = %v", err)
+	}
+	waitForProviderNominationBeforeReady(t, session, 600*time.Millisecond)
+
+	ready := newUDPPacket("session-1", "token-1", common.WORK_P2P_VISITOR, packetTypeReady)
+	ready.NominationEpoch = 1
+	readyRaw, err := EncodeUDPPacket(ready)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(ready) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(readyRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(ready) error = %v", err)
+	}
+
+	select {
+	case pair := <-session.confirmed:
+		if pair.remoteAddr != sendConn.LocalAddr().String() {
+			t.Fatalf("confirmed remote = %q, want %q", pair.remoteAddr, sendConn.LocalAddr().String())
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("provider should handover after READY")
+	}
+}
+
+func TestRuntimeSessionProviderIgnoresDuplicateReadyAfterConfirm(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_PROVIDER,
+		},
+		plan:      PunchPlan{NominationRetryInterval: 40 * time.Millisecond},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 2),
+		nominate:  make(map[string]context.CancelFunc),
+		accept:    make(map[string]context.CancelFunc),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	end := newUDPPacket("session-1", "token-1", common.WORK_P2P_VISITOR, packetTypeEnd)
+	end.NominationEpoch = 1
+	endRaw, err := EncodeUDPPacket(end)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(end) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(endRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(end) error = %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	ready := newUDPPacket("session-1", "token-1", common.WORK_P2P_VISITOR, packetTypeReady)
+	ready.NominationEpoch = 1
+	readyRaw, err := EncodeUDPPacket(ready)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(ready) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(readyRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(first ready) error = %v", err)
+	}
+
+	select {
+	case <-session.confirmed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("provider should confirm after the first READY")
+	}
+
+	if _, err := sendConn.WriteTo(readyRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(duplicate ready) error = %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	select {
+	case pair := <-session.confirmed:
+		t.Fatalf("duplicate READY should not signal confirmed twice, got %#v", pair)
+	default:
+	}
+}
+
+func TestRuntimeSessionVisitorSendsReadyAfterAccept(t *testing.T) {
+	readConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(read) error = %v", err)
+	}
+	defer func() { _ = readConn.Close() }()
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(send) error = %v", err)
+	}
+	defer func() { _ = sendConn.Close() }()
+
+	session := &runtimeSession{
+		start: P2PPunchStart{
+			SessionID: "session-1",
+			Token:     "token-1",
+			Role:      common.WORK_P2P_VISITOR,
+		},
+		cm:        NewCandidateManager(""),
+		confirmed: make(chan confirmedPair, 1),
+		nominate:  make(map[string]context.CancelFunc),
+	}
+	session.cm.Observe(readConn.LocalAddr().String(), sendConn.LocalAddr().String())
+	session.cm.MarkSucceeded(readConn.LocalAddr().String(), sendConn.LocalAddr().String())
+	if _, ok := session.cm.TryNominate(readConn.LocalAddr().String(), sendConn.LocalAddr().String()); !ok {
+		t.Fatal("visitor should nominate pair before ACCEPT")
+	}
+	session.setOutboundNomination(readConn.LocalAddr().String(), sendConn.LocalAddr().String(), 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.readLoopOnConn(ctx, readConn)
+
+	accept := newUDPPacket("session-1", "token-1", common.WORK_P2P_PROVIDER, packetTypeAccept)
+	accept.NominationEpoch = 1
+	acceptRaw, err := EncodeUDPPacket(accept)
+	if err != nil {
+		t.Fatalf("EncodeUDPPacket(accept) error = %v", err)
+	}
+	if _, err := sendConn.WriteTo(acceptRaw, readConn.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(accept) error = %v", err)
+	}
+
+	buf := make([]byte, 2048)
+	_ = sendConn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	defer func() { _ = sendConn.SetReadDeadline(time.Time{}) }()
+	receivedReady := false
+	for !receivedReady {
+		n, _, err := sendConn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom() error = %v", err)
+		}
+		packet, err := DecodeUDPPacket(buf[:n], "token-1")
+		if err != nil {
+			t.Fatalf("DecodeUDPPacket(ready) error = %v", err)
+		}
+		if packet.Type == packetTypeReady {
+			receivedReady = true
 		}
 	}
 
-	if got := buildSmallContiguousPorts(0, 3); len(got) != 0 {
-		t.Fatalf("invalid base should return empty, got %#v", got)
-	}
-}
-
-func TestBuildPredictedPeerAddrs(t *testing.T) {
-	pred := buildPredictedPeerAddrs("1.1.1.1:1000", "1.1.1.1:1002", "2.2.2.2:1004", 2)
-	if len(pred) == 0 {
-		t.Fatal("expected predicted addrs")
-	}
-	want := map[string]bool{
-		"2.2.2.2:1006": true,
-		"2.2.2.2:1002": true,
-		"1.1.1.1:1004": true,
-		"1.1.1.1:1000": true,
-		"1.1.1.1:1002": true,
-		"1.1.1.1:998":  true,
-	}
-	for _, a := range pred {
-		delete(want, a)
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing predicted addrs: %#v", want)
-	}
-
-	if got := buildPredictedPeerAddrs("1.1.1.1:1000", "", "", 0); len(got) != 0 {
-		t.Fatalf("interval 0 should return empty, got %#v", got)
-	}
-}
-
-func TestP2PHelpers(t *testing.T) {
-	if got := natHintByInterval(0, false); got != "unknown" {
-		t.Fatalf("natHintByInterval unknown = %q", got)
-	}
-	if got := natHintByInterval(0, true); got != "cone-ish" {
-		t.Fatalf("natHintByInterval cone-ish = %q", got)
-	}
-	if got := natHintByInterval(2, true); got != "symmetric-ish" {
-		t.Fatalf("natHintByInterval symmetric-ish = %q", got)
-	}
-
-	uniq := uniqAddrStrs(" 1.1.1.1:80 ", "", "1.1.1.1:80", "2.2.2.2:90")
-	if len(uniq) != 2 || uniq[0] != "1.1.1.1:80" || uniq[1] != "2.2.2.2:90" {
-		t.Fatalf("uniqAddrStrs got %#v", uniq)
-	}
-
-	if resolveUDPAddr("") != nil {
-		t.Fatal("resolveUDPAddr empty input should return nil")
-	}
-	if resolveUDPAddr("not-an-addr") != nil {
-		t.Fatal("resolveUDPAddr invalid input should return nil")
-	}
-	ua := resolveUDPAddr("127.0.0.1:12345")
-	if ua == nil {
-		t.Fatal("resolveUDPAddr valid input should return *net.UDPAddr")
-	}
-	if _, ok := interface{}(ua).(*net.UDPAddr); !ok {
-		t.Fatalf("resolveUDPAddr returned unexpected type %T", ua)
-	}
-
-	if got := hostOnly("127.0.0.1:8080"); got != "127.0.0.1" {
-		t.Fatalf("hostOnly host:port = %q", got)
-	}
-	if got := hostOnly("example.com"); got != "example.com" {
-		t.Fatalf("hostOnly hostname only = %q", got)
-	}
-	if got := hostOnly(""); got != "" {
-		t.Fatalf("hostOnly empty = %q", got)
-	}
-
-	if isRegularStep(0, true) {
-		t.Fatal("interval 0 should not be regular")
-	}
-	if isRegularStep(6, true) {
-		t.Fatal("interval 6 should not be regular")
-	}
-	if !isRegularStep(-3, true) {
-		t.Fatal("interval -3 should be regular")
-	}
-	if isRegularStep(3, false) {
-		t.Fatal("has=false should not be regular")
-	}
-}
-
-func TestFillTripletByPortDiff(t *testing.T) {
-	tests := []struct {
-		name       string
-		a1, a2, a3 string
-		want1      string
-		want2      string
-		want3      string
-	}{
-		{
-			name:  "keep complete triplet",
-			a1:    "1.1.1.1:1000",
-			a2:    "1.1.1.1:1003",
-			a3:    "1.1.1.1:1006",
-			want1: "1.1.1.1:1000",
-			want2: "1.1.1.1:1003",
-			want3: "1.1.1.1:1006",
-		},
-		{
-			name:  "fill missing first",
-			a2:    "1.1.1.1:2003",
-			a3:    "1.1.1.1:2006",
-			want1: "1.1.1.1:2000",
-			want2: "1.1.1.1:2003",
-			want3: "1.1.1.1:2006",
-		},
-		{
-			name:  "fill missing middle",
-			a1:    "1.1.1.1:2000",
-			a3:    "1.1.1.1:2006",
-			want1: "1.1.1.1:2000",
-			want2: "1.1.1.1:2003",
-			want3: "1.1.1.1:2006",
-		},
-		{
-			name:  "fill missing last",
-			a1:    "1.1.1.1:2000",
-			a2:    "1.1.1.1:2003",
-			want1: "1.1.1.1:2000",
-			want2: "1.1.1.1:2003",
-			want3: "1.1.1.1:2006",
-		},
-		{
-			name:  "zero diff uses existing endpoint",
-			a2:    "1.1.1.1:3000",
-			a3:    "1.1.1.1:3000",
-			want1: "1.1.1.1:3000",
-			want2: "1.1.1.1:3000",
-			want3: "1.1.1.1:3000",
-		},
-		{
-			name:  "invalid input keeps original",
-			a2:    "bad",
-			a3:    "1.1.1.1:3000",
-			want1: "",
-			want2: "bad",
-			want3: "1.1.1.1:3000",
-		},
-		{
-			name:  "clamp low port",
-			a2:    "1.1.1.1:2",
-			a3:    "1.1.1.1:1",
-			want1: "1.1.1.1:3",
-			want2: "1.1.1.1:2",
-			want3: "1.1.1.1:1",
-		},
-		{
-			name:  "clamp high port",
-			a1:    "1.1.1.1:65534",
-			a2:    "1.1.1.1:65535",
-			want1: "1.1.1.1:65534",
-			want2: "1.1.1.1:65535",
-			want3: "1.1.1.1:65535",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got1, got2, got3 := fillTripletByPortDiff(tt.a1, tt.a2, tt.a3)
-			if got1 != tt.want1 || got2 != tt.want2 || got3 != tt.want3 {
-				t.Fatalf("fillTripletByPortDiff(%q,%q,%q)=(%q,%q,%q), want (%q,%q,%q)",
-					tt.a1, tt.a2, tt.a3, got1, got2, got3, tt.want1, tt.want2, tt.want3)
-			}
-		})
-	}
-}
-
-func TestIsIgnorableUDPIcmpError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "nil", err: nil, want: false},
-		{name: "windows 10054", err: errors.New("wsarecvfrom: An existing connection was forcibly closed by the remote host. 10054"), want: true},
-		{name: "linux connection refused", err: errors.New("read udp 1.1.1.1:1->2.2.2.2:2: connection refused"), want: true},
-		{name: "connection reset by peer", err: errors.New("connection reset by peer"), want: true},
-		{name: "other error", err: errors.New("use of closed network connection"), want: false},
-		{name: "port contains 10054 only", err: errors.New("read udp 127.0.0.1:10054: use of closed network connection"), want: false},
-		{name: "winsock symbolic", err: errors.New("WSARecvFrom failed with WSAECONNRESET"), want: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isIgnorableUDPIcmpError(tt.err); got != tt.want {
-				t.Fatalf("isIgnorableUDPIcmpError(%v)=%v, want %v", tt.err, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsP2PNATProbePacket(t *testing.T) {
-	if !isP2PNATProbePacket([]byte("p2px*#*p2pv*#*1.1.1.1:1*#*")) {
-		t.Fatal("expected nat-probe packet to be recognized")
-	}
-	if isP2PNATProbePacket([]byte("p2pc")) {
-		t.Fatal("non-probe packet should not be recognized as nat-probe")
-	}
-}
-
-func TestPredictionStrategyFlags(t *testing.T) {
-	if !shouldEnableConservativePrediction(false, 0, true, false, false) {
-		t.Fatal("forceHard should enable conservative prediction")
-	}
-	if !shouldEnableConservativePrediction(false, 0, false, true, false) {
-		t.Fatal("portRestrictedByProbe should enable conservative prediction")
-	}
-	if shouldEnableConservativePrediction(false, 0, false, false, false) {
-		t.Fatal("insufficient signal should not enable conservative prediction")
-	}
-
-	if !shouldEnableAggressivePrediction(true, false, 0, 0, true, false, false) {
-		t.Fatal("forceHard with peer ext should enable aggressive prediction")
-	}
-	if !shouldEnableAggressivePrediction(true, false, 0, 0, false, true, false) {
-		t.Fatal("portRestrictedByProbe with peer ext should enable aggressive prediction")
-	}
-	if shouldEnableAggressivePrediction(false, true, 2, 2, true, false, false) {
-		t.Fatal("without peer ext aggressive prediction should stay disabled")
-	}
-
-	if got := normalizePredictionInterval(0, true); got != 1 {
-		t.Fatalf("normalizePredictionInterval(0,true)=%d, want 1", got)
-	}
-	if got := normalizePredictionInterval(3, true); got != 3 {
-		t.Fatalf("normalizePredictionInterval(3,true)=%d, want 3", got)
-	}
-	if got := normalizePredictionInterval(0, false); got != 0 {
-		t.Fatalf("normalizePredictionInterval(0,false)=%d, want 0", got)
-	}
-}
-
-func TestBuildTargetSprayPorts(t *testing.T) {
-	ports := buildTargetSprayPorts(1000, 2, 5)
-	if len(ports) != 5 {
-		t.Fatalf("len(ports)=%d, want 5", len(ports))
-	}
-	if ports[0] != 1000 || ports[1] != 1002 {
-		t.Fatalf("unexpected spray head: %#v", ports)
-	}
-	has := map[int]bool{}
-	for _, p := range ports {
-		has[p] = true
-	}
-	if !has[998] {
-		t.Fatalf("expected delta mirror port 998 in %#v", ports)
-	}
-
-	ports = buildTargetSprayPorts(10, 0, 3)
-	if len(ports) != 3 || ports[0] != 10 {
-		t.Fatalf("unexpected interval=0 ports: %#v", ports)
-	}
-}
-
-func TestMappingConfidenceLowEnablesPrediction(t *testing.T) {
-	plan := selectPunchPlan(true, false, 0, 0, false, false)
-	if !plan.MappingConfidenceLow {
-		t.Fatal("expected mappingConfidenceLow=true for interval=0")
-	}
-	if !plan.EnableConservativePredict {
-		t.Fatal("mappingConfidenceLow should enable conservative prediction")
-	}
-	if !plan.EnableAggressivePredict {
-		t.Fatal("mappingConfidenceLow should enable aggressive prediction when peer ext exists")
-	}
-	if plan.NormalizedInterval != 1 {
-		t.Fatalf("normalized interval=%d, want 1", plan.NormalizedInterval)
-	}
-}
-
-func TestBuildTargetSprayPortsEdgeCases(t *testing.T) {
-	low := buildTargetSprayPorts(1, 1, 5)
-	for _, p := range low {
-		if p < 1 || p > 65535 {
-			t.Fatalf("low edge invalid port: %d", p)
+	select {
+	case pair := <-session.confirmed:
+		if pair.remoteAddr != sendConn.LocalAddr().String() {
+			t.Fatalf("confirmed remote = %q, want %q", pair.remoteAddr, sendConn.LocalAddr().String())
 		}
-	}
-
-	high := buildTargetSprayPorts(65535, 2, 5)
-	for _, p := range high {
-		if p < 1 || p > 65535 {
-			t.Fatalf("high edge invalid port: %d", p)
-		}
-	}
-
-	neg := buildTargetSprayPorts(5000, -2, 5)
-	if len(neg) < 3 || neg[0] != 5000 {
-		t.Fatalf("unexpected negative interval result: %#v", neg)
-	}
-}
-
-func TestSelectPunchPlanDefaults(t *testing.T) {
-	plan := selectPunchPlan(true, true, 2, 2, false, false)
-	if plan.HandshakeTimeoutSec != p2pHandshakeTimeout {
-		t.Fatalf("handshake timeout=%d, want %d", plan.HandshakeTimeoutSec, p2pHandshakeTimeout)
-	}
-	if plan.UseBirthdayAttack {
-		t.Fatal("birthday attack should be reserved/off by default")
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("visitor should handover after ACCEPT")
 	}
 }
